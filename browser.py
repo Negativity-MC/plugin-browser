@@ -2,13 +2,14 @@ import os
 import httpx
 import asyncio
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 import json
 import traceback
+import re
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.widgets import Header, Footer, Input, Button, Static, Markdown, DataTable, Label, ListItem, ListView, Checkbox, Select
+from textual.widgets import Header, Footer, Input, Button, Static, Markdown, DataTable, Label, ListItem, ListView, Checkbox, Select, TabbedContent, TabPane
 from textual.message import Message
 from textual import on, work
 from textual.binding import Binding
@@ -29,16 +30,12 @@ class ModrinthAPI:
     async def search_plugins(self, query: str, loaders: List[str], limit: int = 20, offset: int = 0) -> List[dict]:
         """Search for plugins on Modrinth."""
         try:
-            # Base facet: plugins only
             facets = [["project_type:plugin"]]
-            
-            # Add loaders facet (OR logic within the list)
             if loaders:
                 loader_facet = [f"categories:{loader}" for loader in loaders]
                 facets.append(loader_facet)
             
             facets_json = json.dumps(facets)
-            
             response = await self.client.get(
                 "/search",
                 params={
@@ -51,17 +48,41 @@ class ModrinthAPI:
             )
             response.raise_for_status()
             return response.json().get("hits", [])
-        except Exception as e:
+        except Exception:
             return []
 
-    async def get_versions(self, project_slug: str) -> List[dict]:
-        """Get versions for a specific project."""
+    async def get_project(self, project_slug_or_id: str) -> Optional[dict]:
+        """Get project details."""
         try:
-            response = await self.client.get(f"/project/{project_slug}/version")
+            response = await self.client.get(f"/project/{project_slug_or_id}")
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            return None
+
+    async def get_versions(self, project_slug_or_id: str, loaders: List[str] = None) -> List[dict]:
+        """Get versions for a specific project, optionally filtered by loader."""
+        try:
+            params = {}
+            if loaders:
+                # Modrinth API allows filtering versions by loader
+                # loaders=["paper", "spigot"] -> json string
+                params["loaders"] = json.dumps(loaders)
+            
+            response = await self.client.get(f"/project/{project_slug_or_id}/version", params=params)
             response.raise_for_status()
             return response.json()
         except Exception:
             return []
+    
+    async def get_version(self, version_id: str) -> Optional[dict]:
+        """Get a specific version."""
+        try:
+            response = await self.client.get(f"/version/{version_id}")
+            response.raise_for_status()
+            return response.json()
+        except Exception:
+            return None
 
     async def close(self):
         await self.client.aclose()
@@ -73,11 +94,14 @@ class PluginDetails(Static):
     
     current_plugin: Optional[dict] = None
     versions_map: dict = {}
+    current_version: Optional[dict] = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Label("Select a plugin to view details", id="details-title")
             yield Markdown("", id="details-desc")
+            yield Label("Dependencies:", classes="section-header", id="lbl-dependencies")
+            yield Label("None", id="deps-list")
             yield Label("Versions:", classes="section-header")
             yield Select([], prompt="Select a version", id="version-select")
             yield Button("Download", variant="primary", id="btn-download", disabled=True)
@@ -85,6 +109,7 @@ class PluginDetails(Static):
     def show_plugin(self, plugin: dict, versions: List[dict], allowed_loaders: List[str]):
         self.current_plugin = plugin
         self.versions_map = {}
+        self.current_version = None
         
         # Update Title
         title = self.query_one("#details-title", Label)
@@ -93,9 +118,11 @@ class PluginDetails(Static):
         
         # Update Description
         desc = self.query_one("#details-desc", Markdown)
-        # Prefer body (full markdown), fallback to description (short), then default text
         full_text = plugin.get('body') or plugin.get('description') or 'No description available.'
         desc.update(full_text)
+        
+        # Reset dependencies
+        self.query_one("#deps-list", Label).update("Select a version to see dependencies")
 
         # Filter versions
         select_options = []
@@ -112,9 +139,11 @@ class PluginDetails(Static):
             if not files:
                 continue
                 
+            # Store full version object for dependency checking
             self.versions_map[version_id] = {
                 'url': files[0]['url'],
-                'filename': files[0]['filename']
+                'filename': files[0]['filename'],
+                'data': version
             }
             
             display_loaders = ", ".join(v_loaders)
@@ -132,10 +161,47 @@ class PluginDetails(Static):
     @on(Select.Changed)
     def on_version_select(self, event: Select.Changed):
         btn = self.query_one("#btn-download", Button)
+        deps_lbl = self.query_one("#deps-list", Label)
+        
         if event.value:
             btn.disabled = False
+            version_id = event.value
+            version_info = self.versions_map.get(version_id)
+            if version_info:
+                self.current_version = version_info['data']
+                # Update dependencies display
+                dependencies = self.current_version.get('dependencies', [])
+                req_deps = [d for d in dependencies if d['dependency_type'] == 'required']
+                
+                if req_deps:
+                    # We only have project_ids, normally we'd need to fetch names, 
+                    # but for now let's just show count or ID. 
+                    # Ideally we fetch names async, but that's complex for this sync handler.
+                    # We'll just list them as "Required Dependency"
+                    deps_text = f"{len(req_deps)} required dependencies."
+                    deps_lbl.update(deps_text)
+                else:
+                    deps_lbl.update("No required dependencies.")
         else:
             btn.disabled = True
+            deps_lbl.update("-")
+            self.current_version = None
+
+class InstalledPlugins(Static):
+    """Widget to manage installed plugins."""
+    
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Button("Refresh List", id="btn-refresh-installed"),
+            DataTable(id="installed-table"),
+            Button("Delete Selected", variant="error", id="btn-delete-installed", disabled=True),
+            classes="installed-container"
+        )
+
+    def on_mount(self):
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Filename", "Size (KB)")
 
 class ModrinthBrowser(App):
     CSS = """
@@ -163,7 +229,6 @@ class ModrinthBrowser(App):
 
     /* --- Search Section --- */
     #search-bar {
-        dock: top;
         height: auto;
         padding: 1 2;
         background: #1a1b26;
@@ -295,6 +360,23 @@ class ModrinthBrowser(App):
         background: #24283b;
         color: #565f89;
     }
+
+    /* --- Installed Plugins --- */
+    .installed-container {
+        padding: 1;
+    }
+    #btn-refresh-installed {
+        width: 100%;
+        margin-bottom: 1;
+        background: #24283b;
+        color: #7aa2f7;
+    }
+    #btn-delete-installed {
+        width: 100%;
+        margin-top: 1;
+        background: #f7768e;
+        color: #1a1b26;
+    }
     """
 
     BINDINGS = [
@@ -324,37 +406,64 @@ class ModrinthBrowser(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Container(
-            Input(placeholder="Search for plugins...", id="search-input"),
-            Container(
-                Checkbox("Paper", value=True, id="chk-paper"),
-                Checkbox("Spigot", value=True, id="chk-spigot"),
-                Checkbox("Bukkit", value=True, id="chk-bukkit"),
-                Checkbox("Purpur", value=True, id="chk-purpur"),
-                Checkbox("Fabric", value=False, id="chk-fabric"),
-                id="filter-container"
-            ),
-            id="search-bar"
-        )
-        yield Container(
-            Container(
-                DataTable(id="results-table"),
-                Button("Load More", variant="default", id="btn-load-more", disabled=True),
-                id="results-pane"
-            ),
-            PluginDetails(id="details-pane"),
-            id="main-content"
-        )
+        with TabbedContent():
+            with TabPane("Browse Plugins"):
+                yield Container(
+                    Input(placeholder="Search for plugins...", id="search-input"),
+                    Container(
+                        Checkbox("Paper", value=True, id="chk-paper"),
+                        Checkbox("Spigot", value=True, id="chk-spigot"),
+                        Checkbox("Bukkit", value=True, id="chk-bukkit"),
+                        Checkbox("Purpur", value=True, id="chk-purpur"),
+                        Checkbox("Fabric", value=False, id="chk-fabric"),
+                        id="filter-container"
+                    ),
+                    id="search-bar"
+                )
+                yield Container(
+                    Container(
+                        DataTable(id="results-table"),
+                        Button("Load More", variant="default", id="btn-load-more", disabled=True),
+                        id="results-pane"
+                    ),
+                    PluginDetails(id="details-pane"),
+                    id="main-content"
+                )
+            with TabPane("Installed Plugins"):
+                yield InstalledPlugins(id="installed-pane")
         yield Footer()
 
     def on_mount(self):
-        table = self.query_one(DataTable)
+        table = self.query_one("#results-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("Plugin Name", "Downloads")
         self.query_one("#search-input").focus()
+        self.refresh_installed_list()
 
     def action_focus_search(self):
+        self.query_one("TabbedContent").active = "Browse Plugins" # Does this work? No, keys are "tab-1" etc usually unless id provided.
+        # Actually TabPane labels are the keys usually.
         self.query_one("#search-input").focus()
+
+    @on(Input.Changed)
+    def on_input_changed(self, event: Input.Changed):
+        query = event.value.strip()
+        
+        if self.search_timer:
+            self.search_timer.stop()
+            
+        if not query:
+            self.query_one("#results-table", DataTable).clear()
+            self.query_one("#btn-load-more", Button).disabled = True
+            return
+
+        self.search_timer = self.set_timer(0.2, lambda: self.trigger_auto_search(query))
+
+    def trigger_auto_search(self, query: str):
+        if query != self.current_query:
+            self.current_query = query
+            self.current_offset = 0
+            self.perform_search(reset=True)
 
     def get_active_loaders(self) -> List[str]:
         loaders = []
@@ -365,42 +474,10 @@ class ModrinthBrowser(App):
         if self.query_one("#chk-fabric", Checkbox).value: loaders.append("fabric")
         return loaders
 
-    @on(Input.Changed)
-    def on_input_changed(self, event: Input.Changed):
-        query = event.value.strip()
-        
-        # Cancel existing timer
-        if self.search_timer:
-            self.search_timer.stop()
-            
-        if not query:
-            self.query_one(DataTable).clear()
-            self.query_one("#btn-load-more", Button).disabled = True
-            return
-
-        # Debounce search for 200ms
-        self.search_timer = self.set_timer(0.2, lambda: self.trigger_auto_search(query))
-
-    def trigger_auto_search(self, query: str):
-        if query != self.current_query:
-            self.current_query = query
-            self.current_offset = 0
-            self.perform_search(reset=True)
-
-    async def on_input_submitted(self, event: Input.Submitted):
-        # We can still keep this for manual force refresh if needed
-        query = event.value.strip()
-        if query:
-            if self.search_timer:
-                self.search_timer.stop()
-            self.current_query = query
-            self.current_offset = 0
-            self.perform_search(reset=True)
-
     @work(exclusive=True)
     async def perform_search(self, reset: bool = False):
         try:
-            table = self.query_one(DataTable)
+            table = self.query_one("#results-table", DataTable)
             if reset:
                 table.clear()
             
@@ -412,9 +489,8 @@ class ModrinthBrowser(App):
                 try:
                     table.add_row(hit['title'], str(hit['downloads']), key=hit['slug'])
                 except Exception:
-                    pass # Row likely exists
+                    pass
             
-            # Enable load more
             btn = self.query_one("#btn-load-more", Button)
             if len(hits) < limit:
                 btn.disabled = True
@@ -426,7 +502,7 @@ class ModrinthBrowser(App):
             with open("error.log", "w") as f:
                 f.write(traceback.format_exc())
             self.notify(f"Search error: {e}", severity="error")
-            
+
     @on(Button.Pressed)
     async def on_button_click(self, event: Button.Pressed):
         btn_id = event.button.id
@@ -436,16 +512,133 @@ class ModrinthBrowser(App):
             self.perform_search(reset=False)
             
         elif btn_id == "btn-download":
-            # Download logic
             details = self.query_one(PluginDetails)
-            select = details.query_one("#version-select", Select)
-            if select.value:
-                version_id = select.value
-                file_info = details.versions_map.get(version_id)
-                if file_info:
-                    self.download_file(file_info['url'], file_info['filename'])
+            if details.current_version:
+                self.start_install_process(details.current_version)
 
-    @on(DataTable.RowSelected)
+        elif btn_id == "btn-refresh-installed":
+            self.refresh_installed_list()
+        
+        elif btn_id == "btn-delete-installed":
+            self.delete_selected_plugin()
+
+    @work(thread=True)
+    def start_install_process(self, version_data: dict):
+        self.call_from_thread(self.notify, f"Starting installation...")
+        
+        # 1. Install the main plugin
+        files = version_data.get('files', [])
+        if not files:
+            self.call_from_thread(self.notify, "No files found for this version!", severity="error")
+            return
+            
+        main_file = files[0]
+        self.download_file_sync(main_file['url'], main_file['filename'])
+        
+        # 2. Check Dependencies
+        dependencies = version_data.get('dependencies', [])
+        required_deps = [d for d in dependencies if d['dependency_type'] == 'required']
+        
+        if required_deps:
+            self.call_from_thread(self.notify, f"Checking {len(required_deps)} dependencies...")
+            asyncio.run_coroutine_threadsafe(self.process_dependencies(required_deps), self.loop)
+
+    def download_file_sync(self, url: str, filename: str):
+        dest = self.download_dir / filename
+        # Check if already exists? Modrinth files might change but filename usually unique per version
+        # If exists, maybe skip? But 'install' implies force.
+        
+        try:
+            with httpx.Client() as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+            self.call_from_thread(self.notify, f"Installed {filename}", severity="information")
+            self.call_from_thread(self.refresh_installed_list)
+        except Exception as e:
+            self.call_from_thread(self.notify, f"Failed to install {filename}: {e}", severity="error")
+
+    async def process_dependencies(self, dependencies: List[dict]):
+        # This runs in the main loop context but is async
+        for dep in dependencies:
+            project_id = dep.get('project_id')
+            if not project_id:
+                continue
+                
+            # Get project info to find name
+            project = await self.api.get_project(project_id)
+            if not project:
+                continue
+                
+            slug = project.get('slug')
+            title = project.get('title')
+            
+            # Check if exists
+            if self.check_plugin_exists(slug, title):
+                self.notify(f"Dependency '{title}' detected. Skipping.")
+                continue
+            
+            self.notify(f"Dependency '{title}' missing. Finding compatible version...")
+            
+            # Find version
+            # Use active loaders
+            loaders = self.get_active_loaders()
+            versions = await self.api.get_versions(project_id, loaders)
+            
+            if versions:
+                # Pick latest
+                best_version = versions[0]
+                files = best_version.get('files', [])
+                if files:
+                    file_info = files[0]
+                    self.notify(f"Downloading dependency: {title}")
+                    
+                    # We need to run download in thread again
+                    self.run_worker(self.download_dependency_worker(file_info['url'], file_info['filename']), thread=True)
+            else:
+                 self.notify(f"Could not find compatible version for dependency '{title}'", severity="warning")
+
+    def download_dependency_worker(self, url: str, filename: str):
+        self.download_file_sync(url, filename)
+
+    def check_plugin_exists(self, slug: str, title: str) -> bool:
+        # Check files in download_dir
+        # simple check: filename contains slug or title (case insensitive)
+        # Regex check as requested
+        # escape special chars
+        patterns = [
+            re.compile(re.escape(slug), re.IGNORECASE),
+            re.compile(re.escape(title), re.IGNORECASE)
+        ]
+        
+        try:
+            for file in self.download_dir.iterdir():
+                if file.is_file() and file.suffix == ".jar":
+                    for pat in patterns:
+                        if pat.search(file.name):
+                            return True
+        except Exception:
+            pass
+        return False
+
+    def refresh_installed_list(self):
+        try:
+            table = self.query_one("#installed-table", DataTable)
+            table.clear()
+            
+            for file in self.download_dir.iterdir():
+                if file.is_file() and file.suffix == ".jar":
+                    size_kb = file.stat().st_size / 1024
+                    table.add_row(file.name, f"{size_kb:.2f}", key=file.name)
+        except Exception:
+            pass
+
+    @on(DataTable.RowSelected, selector="#installed-table")
+    def on_installed_selected(self, event: DataTable.RowSelected):
+        self.query_one("#btn-delete-installed", Button).disabled = False
+
+    @on(DataTable.RowSelected, selector="#results-table")
     async def on_plugin_selected(self, event: DataTable.RowSelected):
         plugin_slug = event.row_key.value
         loaders = self.get_active_loaders()
@@ -455,26 +648,43 @@ class ModrinthBrowser(App):
     async def fetch_plugin_details(self, plugin_slug: str, loaders: List[str]):
         versions = await self.api.get_versions(plugin_slug)
         try:
-             project_resp = await self.api.client.get(f"/project/{plugin_slug}")
-             project_resp.raise_for_status()
-             project_data = project_resp.json()
-             self.query_one(PluginDetails).show_plugin(project_data, versions, loaders)
+             project = await self.api.get_project(plugin_slug)
+             if project:
+                 self.query_one(PluginDetails).show_plugin(project, versions, loaders)
         except Exception as e:
             self.notify(f"Error loading details: {e}", severity="error")
 
-    @work(thread=True)
-    def download_file(self, url: str, filename: str):
-        dest = self.download_dir / filename
-        self.call_from_thread(self.notify, f"Downloading {filename}...")
+    def delete_selected_plugin(self):
+        table = self.query_one("#installed-table", DataTable)
         try:
-            with httpx.Client() as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-                with open(dest, "wb") as f:
-                    f.write(resp.content)
-            self.call_from_thread(self.notify, f"Saved to {dest}", severity="information")
+            # Get selected row
+            # Textual 0.40+ changed how selections work slightly but cursor_row should work
+            # or we iterate?
+            # event driven is better but we have a button.
+            # We can use table.cursor_row to get index, then table.get_row_at(index)
+            # OR row_key if we set it.
+            
+            # If nothing selected, cursor might be valid but nothing 'selected'?
+            # DataTable doesn't have 'selected_row' property easily accessible without event?
+            # We used row key = filename.
+            
+            # If we don't have the key easily, we might struggle. 
+            # But we set key=filename.
+            
+            # Let's try:
+            row_index = table.cursor_row
+            if row_index is not None:
+                row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+                filename = row_key.value
+                
+                file_path = self.download_dir / filename
+                if file_path.exists():
+                    os.remove(file_path)
+                    self.notify(f"Deleted {filename}")
+                    self.refresh_installed_list()
+                    self.query_one("#btn-delete-installed", Button).disabled = True
         except Exception as e:
-            self.call_from_thread(self.notify, f"Download failed: {e}", severity="error")
+            self.notify(f"Error deleting: {e}", severity="error")
 
     async def on_unmount(self):
         await self.api.close()

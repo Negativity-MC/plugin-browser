@@ -541,7 +541,7 @@ class ModrinthBrowser(App):
         
         if required_deps:
             self.call_from_thread(self.notify, f"Checking {len(required_deps)} dependencies...")
-            asyncio.run_coroutine_threadsafe(self.process_dependencies(required_deps), self.loop)
+            self.call_from_thread(self.run_worker, self.process_dependencies(required_deps))
 
     def download_file_sync(self, url: str, filename: str):
         dest = self.download_dir / filename
@@ -595,10 +595,11 @@ class ModrinthBrowser(App):
                     self.notify(f"Downloading dependency: {title}")
                     
                     # We need to run download in thread again
-                    self.run_worker(self.download_dependency_worker(file_info['url'], file_info['filename']), thread=True)
+                    self.download_dependency_worker(file_info['url'], file_info['filename'])
             else:
                  self.notify(f"Could not find compatible version for dependency '{title}'", severity="warning")
 
+    @work(thread=True)
     def download_dependency_worker(self, url: str, filename: str):
         self.download_file_sync(url, filename)
 
